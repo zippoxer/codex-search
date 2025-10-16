@@ -227,8 +227,24 @@ fn snippet_from_text(text: &str, query_lower: &str, context: usize) -> Snippet {
         }
     };
 
-    let start_snip = start_char.saturating_sub(context);
-    let end_snip = (end_char + context).min(text_chars.len());
+    let available_left = start_char;
+    let available_right = text_chars.len() - end_char;
+
+    let mut left_take = context.min(available_left);
+    let mut right_take = context.min(available_right);
+
+    if left_take < context {
+        let redistribute = context - left_take;
+        right_take = (right_take + redistribute).min(available_right);
+    }
+
+    if right_take < context {
+        let redistribute = context - right_take;
+        left_take = (left_take + redistribute).min(available_left);
+    }
+
+    let start_snip = start_char.saturating_sub(left_take);
+    let end_snip = (end_char + right_take).min(text_chars.len());
 
     let mut segments = Vec::new();
 
@@ -325,5 +341,25 @@ mod tests {
         assert_eq!(snippet.segments.len(), 1);
         assert_eq!(snippet.segments[0].text, "foo bar baz");
         assert!(!snippet.segments[0].highlighted);
+    }
+
+    #[test]
+    fn snippet_balances_context_when_room_on_both_sides() {
+        let prefix = "a".repeat(80);
+        let suffix = "b".repeat(80);
+        let text = format!("{prefix}match{suffix}");
+        let snippet = snippet_from_text(&text, "match", 20);
+
+        let combined: String = snippet
+            .segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect();
+
+        let match_idx = combined.find("match").unwrap();
+        let total_len = combined.len();
+
+        assert!(match_idx > total_len / 4, "match too close to start");
+        assert!(match_idx < (total_len * 3) / 4, "match too close to end");
     }
 }
