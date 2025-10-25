@@ -16,6 +16,8 @@ pub struct Scorer {
     matcher: SkimMatcherV2,
     query: String,
     query_lower: String,
+    query_ws: String,
+    query_terms: Vec<String>,
     now: OffsetDateTime,
     is_empty_query: bool,
 }
@@ -24,6 +26,12 @@ impl Scorer {
     pub fn new(query: &str) -> Self {
         let trimmed = query.trim().to_owned();
         let query_lower = trimmed.to_lowercase();
+        let query_ws = collapse_ws(&query_lower);
+        let query_terms: Vec<String> = query_lower
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         let is_empty_query = trimmed.is_empty();
         let matcher = SkimMatcherV2::default()
             .ignore_case()
@@ -34,6 +42,8 @@ impl Scorer {
             matcher,
             query: trimmed,
             query_lower,
+            query_ws,
+            query_terms,
             now: OffsetDateTime::now_utc(),
             is_empty_query,
         }
@@ -62,15 +72,21 @@ impl Scorer {
             return Some((score, preview, snippet));
         }
 
-        let blob_score = self.matcher.fuzzy_match(&session.search_blob, &self.query);
+        // Avoid fuzzy matching on the entire blob (costly). Use contains on the pre-lowered blob.
+        let blob_score = None;
         let label_score = self.matcher.fuzzy_match(&session.label, &self.query);
         let uuid_score = self.matcher.fuzzy_match(&session.uuid, &self.query);
 
-        let blob_lower = session.search_blob.to_lowercase();
-        let label_lower = session.label.to_lowercase();
-        let uuid_lower = session.uuid.to_lowercase();
+        let label_lower = &session.label_lower;
+        let uuid_lower = &session.uuid_lower;
 
-        let matches_text = blob_lower.contains(&self.query_lower)
+        let terms_match = self
+            .query_terms
+            .iter()
+            .all(|t| session.search_blob_ws_lower.contains(t));
+
+        let matches_text = session.search_blob_ws_lower.contains(&self.query_ws)
+            || terms_match
             || label_lower.contains(&self.query_lower)
             || uuid_lower.contains(&self.query_lower);
 
@@ -85,7 +101,7 @@ impl Scorer {
             snippet_from_text(&message.full_text, &self.query_lower, SNIPPET_CONTEXT_CHARS)
         } else if label_lower.contains(&self.query_lower) {
             snippet_from_text(&session.label, &self.query_lower, SNIPPET_CONTEXT_CHARS)
-        } else if blob_lower.contains(&self.query_lower) {
+        } else if session.search_blob_ws_lower.contains(&self.query_ws) {
             snippet_from_text(
                 &session.search_blob,
                 &self.query_lower,
@@ -168,7 +184,14 @@ fn best_message_for_session(
 
     for message in &session.messages {
         let fuzzy = matcher.fuzzy_match(&message.full_text, query).unwrap_or(0) as i64;
-        let contains = message.full_text.to_lowercase().contains(query_lower);
+        let contains = {
+            let qws = collapse_ws(query_lower);
+            let tokens_ok = query_lower
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .all(|t| message.full_text_ws_lower.contains(t));
+            message.full_text_ws_lower.contains(&qws) || tokens_ok
+        };
         let total = fuzzy + if contains { 6_000 } else { 0 };
         if total > best_score {
             best_score = total;
@@ -193,8 +216,11 @@ fn snippet_from_text(text: &str, query_lower: &str, context: usize) -> Snippet {
         };
     }
 
+    // Normalize whitespace to keep matches contiguous across newlines/tabs
+    let normalized = normalize_snippet_text(text);
+
     if query_lower.is_empty() {
-        let snippet: String = text.chars().take(context * 2).collect();
+        let snippet: String = normalized.chars().take(context * 2).collect();
         let snippet = normalize_snippet_text(&snippet).trim().to_string();
         return Snippet {
             segments: vec![SnippetSegment {
@@ -204,8 +230,8 @@ fn snippet_from_text(text: &str, query_lower: &str, context: usize) -> Snippet {
         };
     }
 
-    let text_chars: Vec<char> = text.chars().collect();
-    let lowercase = text.to_lowercase();
+    let text_chars: Vec<char> = normalized.chars().collect();
+    let lowercase = normalized.to_lowercase();
     let pos = lowercase.find(query_lower);
 
     let (start_char, end_char) = match pos {
@@ -362,4 +388,20 @@ mod tests {
         assert!(match_idx > total_len / 4, "match too close to start");
         assert!(match_idx < (total_len * 3) / 4, "match too close to end");
     }
+}
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+    out.trim().to_string()
 }

@@ -1,5 +1,6 @@
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
+use once_cell::sync::Lazy;
 
 const DISPLAY_DATE: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day] [hour]:[minute]");
@@ -56,6 +57,8 @@ pub fn format_relative(dt: OffsetDateTime, reference: OffsetDateTime) -> String 
     format!("{}d {}h ago", days, rem_hours)
 }
 
-fn local_offset() -> UtcOffset {
+static LOCAL_OFFSET: Lazy<UtcOffset> = Lazy::new(|| {
     UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
-}
+});
+
+fn local_offset() -> UtcOffset { *LOCAL_OFFSET }

@@ -19,6 +19,10 @@ pub struct Message {
     pub timestamp: Option<OffsetDateTime>,
     #[serde(skip_serializing)]
     pub full_text: String,
+    #[serde(skip_serializing)]
+    pub full_text_lower: String,
+    #[serde(skip_serializing)]
+    pub full_text_ws_lower: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,15 +30,25 @@ pub struct Session {
     pub uuid: String,
     pub label: String,
     #[serde(skip_serializing)]
+    pub label_lower: String,
+    #[serde(skip_serializing)]
     pub path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<OffsetDateTime>,
     pub updated_at: OffsetDateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_message_time: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     pub messages: Vec<Message>,
     #[serde(skip_serializing)]
     pub search_blob: String,
+    #[serde(skip_serializing)]
+    pub search_blob_lower: String,
+    #[serde(skip_serializing)]
+    pub search_blob_ws_lower: String,
+    #[serde(skip_serializing)]
+    pub uuid_lower: String,
 }
 
 impl Session {

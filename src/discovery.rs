@@ -18,6 +18,7 @@ use walkdir::WalkDir;
 use crate::session::{Message, MessageRole, Session};
 
 const SEARCH_BLOB_LIMIT: usize = 64 * 1024;
+const MAX_MESSAGE_CHARS: usize = 8 * 1024;
 
 pub struct SessionStream {
     receiver: Receiver<Session>,
@@ -46,7 +47,8 @@ impl DiscoveryOptions {
     pub fn with_defaults() -> Result<Self> {
         Ok(Self {
             root: default_sessions_dir()?,
-            scan_limit: 400,
+            // Lower default scan limit to keep TUI snappy on large datasets
+            scan_limit: 50,
             preview_char_limit: 240,
         })
     }
@@ -143,6 +145,7 @@ pub fn load_session_from_path(path: PathBuf, preview_char_limit: usize) -> Resul
 
     let mut messages: Vec<Message> = Vec::new();
     let mut search_blob = String::new();
+    let mut detected_cwd: Option<PathBuf> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -161,6 +164,12 @@ pub fn load_session_from_path(path: PathBuf, preview_char_limit: usize) -> Resul
                     }
                     messages.push(msg);
                 }
+                // Always try to detect cwd regardless of meta flag; capture only once
+                if detected_cwd.is_none() {
+                    if let Some(cwd) = extract_cwd_from_text(&full_text) {
+                        detected_cwd = Some(cwd);
+                    }
+                }
             }
         }
     }
@@ -170,6 +179,8 @@ pub fn load_session_from_path(path: PathBuf, preview_char_limit: usize) -> Resul
     }
 
     let (label, created_at, uuid) = parse_from_filename(&path)?;
+    let label_lower = label.to_lowercase();
+    let uuid_lower = uuid.to_lowercase();
     let latest_message_time = messages.iter().filter_map(|m| m.timestamp).max();
 
     if !search_blob.is_empty() {
@@ -178,26 +189,71 @@ pub fn load_session_from_path(path: PathBuf, preview_char_limit: usize) -> Resul
     search_blob.push_str(&label);
     search_blob.push('\n');
     search_blob.push_str(&uuid);
+    let search_blob_lower = search_blob.to_lowercase();
+    let search_blob_ws_lower = collapse_ws_lower(&search_blob_lower);
 
     Ok(Some(Session {
         uuid,
         label,
+        label_lower,
         path,
         created_at,
         updated_at,
         latest_message_time,
+        cwd: detected_cwd,
         messages,
         search_blob,
+        search_blob_lower,
+        search_blob_ws_lower,
+        uuid_lower,
     }))
 }
 
 fn extract_message(value: &Value, preview_char_limit: usize) -> Option<(Message, String, bool)> {
-    let (role_raw, content, ts_value) = if let Some(payload) = value.get("payload") {
+    // Supported shapes:
+    // 1) { type: "response_item", payload: { type: "message", role: "user"|"assistant", content: [...] } }
+    // 2) { type: "event_msg", payload: { type: "user_message", message: "..." } }
+    // 3) Flat: { role: "user"|"assistant", content: [...] }
+    // Special-case: event stream user_message (no content array)
+    if let Some(payload) = value.get("payload") {
         let payload_obj = payload.as_object()?;
         match payload_obj.get("type").and_then(Value::as_str) {
-            Some("message") => {}
+            Some("user_message") => {
+                let content_text = payload_obj.get("message").and_then(Value::as_str)?;
+                let timestamp = payload_obj
+                    .get("timestamp")
+                    .or_else(|| payload_obj.get("create_time"))
+                    .or_else(|| payload_obj.get("createTime"));
+
+                let full_text = content_text.to_owned();
+                let clipped = clip_chars(&full_text, MAX_MESSAGE_CHARS);
+                let preview = make_preview(&clipped, preview_char_limit);
+                let timestamp = timestamp
+                    .and_then(parse_timestamp_value)
+                    .or_else(|| extract_timestamp(value));
+                let is_meta = is_meta_text(&full_text);
+                return Some((
+                    Message {
+                        role: MessageRole::User,
+                        text: preview,
+                        timestamp,
+                        full_text: clipped.clone(),
+                        full_text_lower: clipped.to_lowercase(),
+                        full_text_ws_lower: collapse_ws_lower(&clipped.to_lowercase()),
+                    },
+                    clipped,
+                    is_meta,
+                ));
+            }
+            Some("message") => {
+                // Fall through to the generic path below
+            }
             _ => return None,
         }
+    }
+
+    let (role_raw, content, ts_value) = if let Some(payload) = value.get("payload") {
+        let payload_obj = payload.as_object()?;
         let role = payload_obj.get("role").and_then(Value::as_str)?;
         let content = payload_obj.get("content")?;
         let timestamp = payload_obj
@@ -222,7 +278,8 @@ fn extract_message(value: &Value, preview_char_limit: usize) -> Option<(Message,
     };
 
     let full_text = extract_text(content)?;
-    let preview = make_preview(&full_text, preview_char_limit);
+    let clipped = clip_chars(&full_text, MAX_MESSAGE_CHARS);
+    let preview = make_preview(&clipped, preview_char_limit);
 
     let timestamp = ts_value
         .and_then(parse_timestamp_value)
@@ -235,9 +292,11 @@ fn extract_message(value: &Value, preview_char_limit: usize) -> Option<(Message,
             role,
             text: preview,
             timestamp,
-            full_text: full_text.clone(),
+            full_text: clipped.clone(),
+            full_text_lower: clipped.to_lowercase(),
+            full_text_ws_lower: collapse_ws_lower(&clipped.to_lowercase()),
         },
-        full_text,
+        clipped,
         is_meta,
     ))
 }
@@ -249,11 +308,24 @@ fn extract_text(content: &Value) -> Option<String> {
             let mut acc = String::new();
             for item in items {
                 if let Value::Object(map) = item {
-                    if let Some(Value::String(text)) = map.get("text") {
+                    // Only include visible user/assistant text; skip thinking/tool internals.
+                    let allowed = match map.get("type").and_then(Value::as_str) {
+                        Some(t) => matches!(
+                            t,
+                            "input_text"
+                                | "output_text"
+                                | "assistant_text"
+                                | "text"
+                        ),
+                        None => true,
+                    };
+                    if allowed {
+                        if let Some(Value::String(text)) = map.get("text") {
                         if !acc.is_empty() {
                             acc.push('\n');
                         }
                         acc.push_str(text);
+                        }
                     }
                 }
             }
@@ -329,6 +401,58 @@ fn make_preview(full_text: &str, limit: usize) -> String {
     } else {
         preview
     }
+}
+
+fn extract_cwd_from_text(text: &str) -> Option<PathBuf> {
+    static CWD_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?si)<environment_context>.*?<cwd>(?P<cwd>[^<]+)</cwd>.*?</environment_context>")
+            .expect("invalid cwd regex")
+    });
+    let trimmed = text.trim();
+    if let Some(caps) = CWD_RE.captures(trimmed) {
+        let raw = caps.name("cwd").map(|m| m.as_str().trim().to_string())?;
+        let expanded = expand_tilde(&raw);
+        return Some(PathBuf::from(expanded));
+    }
+    None
+}
+
+fn expand_tilde(p: &str) -> String {
+    if p.starts_with("~/") {
+        if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+            let mut s = home.to_string_lossy().to_string();
+            if !s.ends_with('/') { s.push('/'); }
+            s.push_str(&p[2..]);
+            return s;
+        }
+    }
+    p.to_string()
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit { return text.to_owned(); }
+    let mut it = text.chars();
+    let mut out = String::with_capacity(limit + 1);
+    for _ in 0..limit { if let Some(ch) = it.next() { out.push(ch); } else { break; } }
+    out.push('…');
+    out
+}
+
+fn collapse_ws_lower(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 fn parse_from_filename(path: &Path) -> Result<(String, Option<OffsetDateTime>, String)> {

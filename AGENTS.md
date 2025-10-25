@@ -53,7 +53,8 @@ cargo run -- --json "ItemEditor" | jq '.[0]'
 | Flag | Description |
 |------|-------------|
 | `--limit N` | Cap displayed results (default 20). |
-| `--scan-limit N` | Limit filesystem scan depth (default 400 files). |
+| `--scan-limit N` | Limit filesystem scan depth (default 50 files). |
+| `--cwd` | Only include sessions tied to the current working directory (when session records `<environment_context><cwd>…</cwd>`). |
 | `--sessions-dir PATH` | Override the Codex session directory (useful for tests). |
 | `--resume-command CMD` | Shell template run when selecting a session (`{uuid}` placeholder). |
 | `--dry-run` | Print the resume command instead of executing it. |
@@ -74,7 +75,7 @@ cargo run -- --json "ItemEditor" | jq '.[0]'
 
 ## Code Conventions
 
-- Discovery streams sessions via channels; avoid blocking `Vec` scans in the TUI path.
+- Discovery streams sessions via channels; avoid blocking `Vec` scans in the TUI path. Default scan window is 50 most-recent files (override with `--scan-limit` or `CODEX_SEARCH_SCAN_LIMIT`).
 - Sessions are wrapped in `Arc` when stored in UI state so nucleo can reference data lock-free.
 - All ranking logic lives in `src/search.rs`; keep CLI and TUI behaviour consistent by using the shared `Scorer`.
 - Time formatting in `src/util.rs` is intentionally terse (seconds/minutes/hours/days).
